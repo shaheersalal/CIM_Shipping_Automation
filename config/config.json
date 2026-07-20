@@ -1,0 +1,25 @@
+{
+  "_comment": "POC configuration. Swap these values once real per-port setup-form data is available from the client. Nothing in the rule engine, email module, or reminder module should hardcode these.",
+
+  "confidence_threshold": 80,
+  "reminder_cadence_days": 3,
+  "escalation_trigger_count": 3,
+
+  "director_email": "director@emkay-shipping.example",
+  "director_name": "Director Ops (placeholder)",
+  "trade_team_email": "tradeteam@emkay-shipping.example",
+  "trade_person_name": "Trade Team",
+
+  "severity_tiers": {
+    "just_over": [1, 15],
+    "moderate": [16, 45],
+    "severe": [46, null]
+  },
+
+  "confidence_penalties": {
+    "missing_port": 30,
+    "missing_depot": 20,
+    "missing_region": 10,
+    "missing_country": 10
+  }
+}
