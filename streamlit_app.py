@@ -101,14 +101,15 @@ st.warning(
 
 with st.sidebar:
     st.header("Data source")
-    uploaded = st.file_uploader("Upload activity Excel (optional)", type=["xlsx"])
-    if uploaded is not None:
-        file_bytes = uploaded.getvalue()
-        st.caption(f"Using uploaded file: {uploaded.name}")
-    else:
-        with open(DEFAULT_XLSX, "rb") as f:
-            file_bytes = f.read()
-        st.caption(f"Using bundled demo file: {DEFAULT_XLSX}")
+    st.caption(f"✅ Loaded automatically: `{DEFAULT_XLSX}`")
+    with open(DEFAULT_XLSX, "rb") as f:
+        file_bytes = f.read()
+
+    with st.expander("🔧 Advanced: use a different Excel file"):
+        uploaded = st.file_uploader("Upload activity Excel", type=["xlsx"])
+        if uploaded is not None:
+            file_bytes = uploaded.getvalue()
+            st.caption(f"Using uploaded file: {uploaded.name}")
 
     st.divider()
     st.header("⚙️ Live config")
