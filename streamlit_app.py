@@ -28,8 +28,58 @@ st.set_page_config(
     layout="wide",
 )
 
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
+
 
 # ---------------------------------------------------------------- helpers --
+
+def inject_theme_css(dark: bool):
+    """
+    Streamlit's own theme picker lives one click deep in its hamburger menu
+    and only offers Light/Dark/System -- this forces the same look via a
+    single visible button instead, by overriding the CSS variables the
+    default themes already use.
+    """
+    if dark:
+        bg, secondary_bg, text, border = "#0e1117", "#262730", "#fafafa", "#41434c"
+    else:
+        bg, secondary_bg, text, border = "#ffffff", "#f0f2f6", "#31333F", "#d5d6d8"
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+            background-color: {bg};
+        }}
+        [data-testid="stAppViewContainer"] {{
+            color: {text};
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: {secondary_bg};
+        }}
+        [data-testid="stSidebar"] * {{
+            color: {text} !important;
+        }}
+        [data-testid="stMetricValue"], [data-testid="stMetricLabel"], [data-testid="stMetricDelta"] {{
+            color: {text} !important;
+        }}
+        .stTabs [data-baseweb="tab-list"] {{
+            background-color: {secondary_bg};
+            border-radius: 6px;
+        }}
+        .stTabs [data-baseweb="tab"] p {{
+            color: {text};
+        }}
+        div[data-testid="stExpander"] {{
+            background-color: {secondary_bg};
+            border: 1px solid {border};
+            border-radius: 6px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 @st.cache_data(show_spinner="Running detection + confidence scoring...")
 def compute_report(file_bytes: bytes, config_json: str) -> pd.DataFrame:
@@ -90,8 +140,21 @@ def play_full_demo(container_numbers: list[str], config: dict):
 
 # ------------------------------------------------------------------ data --
 
-st.title("🚢 Container Aging & Export Reminder Automation")
-st.caption("Proof of concept -- detection logic, confidence-scored email drafting, and simulated reminder/escalation lifecycle")
+top_l, top_r = st.columns([9, 1])
+with top_l:
+    st.title("🚢 Container Aging & Export Reminder Automation")
+    st.caption("Proof of concept -- detection logic, confidence-scored email drafting, and simulated reminder/escalation lifecycle")
+with top_r:
+    st.write("")
+    if st.button(
+        "☀️ Light" if st.session_state.dark_mode else "🌙 Dark",
+        help="Toggle dark/light mode",
+        width="stretch",
+    ):
+        st.session_state.dark_mode = not st.session_state.dark_mode
+
+inject_theme_css(st.session_state.dark_mode)
+PLOT_TEMPLATE = "plotly_dark" if st.session_state.dark_mode else "plotly_white"
 
 st.warning(
     f"⚠️ **{SYNTHETIC_DATA_NOTICE}** All Agreed_Free_Days values in this demo are "
@@ -157,15 +220,15 @@ with tab_dash:
     with col1:
         by_cat = report_df["idle_category"].value_counts().reset_index()
         by_cat.columns = ["Category", "Count"]
-        st.plotly_chart(px.bar(by_cat, x="Category", y="Count", title="Idle containers by category"), width='stretch')
+        st.plotly_chart(px.bar(by_cat, x="Category", y="Count", title="Idle containers by category", template=PLOT_TEMPLATE), width='stretch')
     with col2:
         by_sev = report_df["severity_tier"].value_counts().reset_index()
         by_sev.columns = ["Severity", "Count"]
-        st.plotly_chart(px.pie(by_sev, names="Severity", values="Count", title="By severity tier (reporting only)"), width='stretch')
+        st.plotly_chart(px.pie(by_sev, names="Severity", values="Count", title="By severity tier (reporting only)", template=PLOT_TEMPLATE), width='stretch')
 
     by_status = report_df["email_status"].value_counts().reset_index()
     by_status.columns = ["Status", "Count"]
-    st.plotly_chart(px.bar(by_status, x="Status", y="Count", color="Status", title="Email readiness"), width='stretch')
+    st.plotly_chart(px.bar(by_status, x="Status", y="Count", color="Status", title="Email readiness", template=PLOT_TEMPLATE), width='stretch')
 
 # ------------------------------------------------------------------ report --
 
