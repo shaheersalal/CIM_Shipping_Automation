@@ -81,6 +81,35 @@ def inject_theme_css(dark: bool):
         unsafe_allow_html=True,
     )
 
+
+# Native st.warning/error/info/success rely on Streamlit's real active theme
+# for their background+text colors, which does not follow our forced toggle
+# above -- so they can end up unreadable (e.g. dark text on a dark box) in
+# whichever mode doesn't match the real theme. These self-styled versions
+# use our own explicit colors instead, guaranteeing contrast in both modes.
+ALERT_PALETTE = {
+    "warning": {"light": ("#fff3cd", "#664d03", "#ffe69c"), "dark": ("#3d3212", "#ffe69c", "#6b5615")},
+    "error":   {"light": ("#f8d7da", "#58151c", "#f1aeb5"), "dark": ("#2c0b0e", "#f1aeb5", "#842029")},
+    "success": {"light": ("#d1e7dd", "#0a3622", "#a3cfbb"), "dark": ("#051b11", "#a3cfbb", "#146c43")},
+    "info":    {"light": ("#cff4fc", "#055160", "#9eeaf9"), "dark": ("#032830", "#9eeaf9", "#087990")},
+}
+ALERT_ICONS = {"warning": "⚠️", "error": "🚫", "success": "✅", "info": "ℹ️"}
+
+
+def themed_alert(kind: str, message_html: str):
+    mode = "dark" if st.session_state.dark_mode else "light"
+    bg, text, border = ALERT_PALETTE[kind][mode]
+    st.markdown(
+        f"""
+        <div style="background-color:{bg}; color:{text}; border:1px solid {border};
+                    border-radius:8px; padding:0.75rem 1rem; margin-bottom:1rem; font-size:0.95rem;">
+            {ALERT_ICONS[kind]} {message_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_data(show_spinner="Running detection + confidence scoring...")
 def compute_report(file_bytes: bytes, config_json: str) -> pd.DataFrame:
     config = json.loads(config_json)
@@ -156,10 +185,10 @@ with top_r:
 inject_theme_css(st.session_state.dark_mode)
 PLOT_TEMPLATE = "plotly_dark" if st.session_state.dark_mode else "plotly_white"
 
-st.warning(
-    f"⚠️ **{SYNTHETIC_DATA_NOTICE}** All Agreed_Free_Days values in this demo are "
+themed_alert(
+    "warning",
+    f"<strong>{SYNTHETIC_DATA_NOTICE}</strong> All Agreed_Free_Days values in this demo are "
     "assumed for POC purposes only -- not the client's real business rule.",
-    icon="⚠️",
 )
 
 with st.sidebar:
@@ -263,7 +292,7 @@ with tab_report:
 
 with tab_email:
     if report_df.empty:
-        st.info("No idle containers to preview.")
+        themed_alert("info", "No idle containers to preview.")
     else:
         selected = st.selectbox("Select container", report_df["CONTAINERNO"].tolist())
         row = report_df[report_df["CONTAINERNO"] == selected].iloc[0]
@@ -278,7 +307,7 @@ with tab_email:
         m4.metric("Confidence score", f"{row['confidence_score']}/100")
 
         if row["review_reasons"] != "none":
-            st.error(f"Review reasons: {row['review_reasons']}")
+            themed_alert("error", f"Review reasons: {row['review_reasons']}")
 
         st.text_area("Filled email template", row["email_text"], height=220)
 
@@ -301,7 +330,7 @@ with tab_sim:
     if bcol3.button("🔄 Reset simulation", width='stretch'):
         reset_simulation(report_df)
 
-    st.info(f"**Simulated date:** {st.session_state.sim_date.isoformat()}")
+    themed_alert("info", f"<strong>Simulated date:</strong> {st.session_state.sim_date.isoformat()}")
 
     with st.expander("📝 Log a commitment (suppresses reminders until the date passes)"):
         cc1, cc2, cc3 = st.columns([2, 2, 1])
@@ -309,7 +338,7 @@ with tab_sim:
         commit_date = cc2.date_input("Committed resolution date", st.session_state.sim_date + timedelta(days=7))
         if cc3.button("Log it"):
             st.session_state.sim_store.register_commitment(commit_container, commit_date.isoformat())
-            st.success(f"Commitment logged for {commit_container} until {commit_date.isoformat()}")
+            themed_alert("success", f"Commitment logged for {commit_container} until {commit_date.isoformat()}")
 
     if st.session_state.spotlight_a or st.session_state.spotlight_b:
         st.subheader("Spotlight containers")
