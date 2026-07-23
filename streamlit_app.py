@@ -1,10 +1,12 @@
 """
-Container Aging & Export Reminder Automation -- interactive POC demo.
+Container Aging & Export Reminder Automation -- interactive POC demo (v2).
 
-This is a thin UI layer only. All business logic lives in src/ and is
-imported unchanged from the CLI version (src/rule_engine.py,
-src/email_templates.py, src/reminder_engine.py) -- the web app never
-re-implements detection, scoring, or reminder logic, it just visualizes it.
+Port-centric redesign: free days are resolved per container via its Port
+(optionally Port + Activity Type) against a live-editable Setup &
+Configuration table (client requirement doc §4.1), not a synthetic
+per-container value. This is a thin UI layer only -- all business logic
+lives in src/ (rule_engine.py, email_templates.py, reminder_engine.py,
+port_config_store.py) and is imported unchanged from the CLI version.
 """
 import io
 import json
@@ -15,12 +17,14 @@ import plotly.express as px
 import streamlit as st
 
 from src.config_loader import load_config
-from src.rule_engine import classify_idle, SYNTHETIC_DATA_NOTICE
+from src.port_config_store import seed_from_storage_slab, resolve_config, CONFIG_COLUMNS, SEED_CONTEXT_COLUMNS
+from src.rule_engine import classify_idle, build_port_summary, SAMPLE_CONFIG_NOTICE
 from src.email_templates import build_email_report
 from src.reminder_engine import ReminderStateStore, process_run
 
 SIM_START_DATE = date(2026, 7, 20)
-DEFAULT_XLSX = "Activities_Demo_data_with_agreed_days.xlsx"
+DEFAULT_XLSX = "Activities_Demo_data.xlsx"
+STORAGE_SLAB_PATH = "Storage_slab.xlsx"
 
 st.set_page_config(
     page_title="Container Aging & Reminder Automation -- POC",
@@ -82,11 +86,10 @@ def inject_theme_css(dark: bool):
     )
 
 
-# Native st.warning/error/info/success rely on Streamlit's real active theme
-# for their background+text colors, which does not follow our forced toggle
-# above -- so they can end up unreadable (e.g. dark text on a dark box) in
-# whichever mode doesn't match the real theme. These self-styled versions
-# use our own explicit colors instead, guaranteeing contrast in both modes.
+# Native st.warning/error/info/success color themselves from Streamlit's
+# real active theme, which our forced toggle above doesn't touch -- causing
+# unreadable text in whichever mode diverges from the real theme. These
+# self-styled versions use our own explicit colors, guaranteeing contrast.
 ALERT_PALETTE = {
     "warning": {"light": ("#fff3cd", "#664d03", "#ffe69c"), "dark": ("#3d3212", "#ffe69c", "#6b5615")},
     "error":   {"light": ("#f8d7da", "#58151c", "#f1aeb5"), "dark": ("#2c0b0e", "#f1aeb5", "#842029")},
@@ -110,12 +113,14 @@ def themed_alert(kind: str, message_html: str):
     )
 
 
-@st.cache_data(show_spinner="Running detection + confidence scoring...")
-def compute_report(file_bytes: bytes, config_json: str) -> pd.DataFrame:
-    config = json.loads(config_json)
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    idle_df = classify_idle(df, config)
-    return build_email_report(idle_df, config)
+@st.cache_data(show_spinner="Loading activity data...")
+def load_activities(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(file_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def load_seed_config(path: str) -> pd.DataFrame:
+    return seed_from_storage_slab(path)
 
 
 def init_session_state(report_df: pd.DataFrame):
@@ -167,12 +172,31 @@ def play_full_demo(container_numbers: list[str], config: dict):
             )
 
 
+def counts_df(series: pd.Series, label: str) -> pd.DataFrame:
+    vc = series.value_counts().reset_index()
+    vc.columns = [label, "Count"]
+    return vc
+
+
+def resolve_event_recipient(container_no: str, event: str, port_lookup: dict) -> str:
+    contacts = port_lookup.get(container_no)
+    if not contacts:
+        return ""
+    if event.startswith("REMINDER"):
+        return contacts.get("trade_person_email") or ""
+    if event == "ESCALATED_TO_HEAD":
+        return contacts.get("head_email") or ""
+    if event == "ESCALATED_TO_DIRECTOR":
+        return contacts.get("director_email") or ""
+    return ""
+
+
 # ------------------------------------------------------------------ data --
 
 top_l, top_r = st.columns([9, 1])
 with top_l:
     st.title("🚢 Container Aging & Export Reminder Automation")
-    st.caption("Proof of concept -- detection logic, confidence-scored email drafting, and simulated reminder/escalation lifecycle")
+    st.caption("Proof of concept -- port-centric idle detection, confidence-scored email drafting, and simulated reminder/escalation lifecycle")
 with top_r:
     st.write("")
     if st.button(
@@ -187,8 +211,7 @@ PLOT_TEMPLATE = "plotly_dark" if st.session_state.dark_mode else "plotly_white"
 
 themed_alert(
     "warning",
-    f"<strong>{SYNTHETIC_DATA_NOTICE}</strong> All Agreed_Free_Days values in this demo are "
-    "assumed for POC purposes only -- not the client's real business rule.",
+    f"<strong>{SAMPLE_CONFIG_NOTICE}</strong>",
 )
 
 with st.sidebar:
@@ -215,7 +238,7 @@ with st.sidebar:
         "Reminder cadence (simulated days)", 1, 30, base_config["reminder_cadence_days"],
     )
     escalation_trigger_count = st.number_input(
-        "Escalation trigger (# reminders)", 1, 10, base_config["escalation_trigger_count"],
+        "Escalation trigger (# reminders before Head)", 1, 10, base_config["escalation_trigger_count"],
     )
 
 config = dict(base_config)
@@ -223,70 +246,228 @@ config["confidence_threshold"] = confidence_threshold
 config["reminder_cadence_days"] = int(reminder_cadence_days)
 config["escalation_trigger_count"] = int(escalation_trigger_count)
 
-report_df = compute_report(file_bytes, json.dumps(config, sort_keys=True))
+activities_df = load_activities(file_bytes)
+
+tab_dash, tab_report, tab_email, tab_sim, tab_setup = st.tabs(
+    ["📊 Dashboard", "📋 Idle Containers", "✉️ Email Preview",
+     "⏱️ Reminder Simulator", "⚙️ Setup & Configuration"]
+)
+
+# ---------------------------------------------------------- setup (first) --
+# Written first in the file (even though it's the last visual tab) so the
+# edited port_config_df is available below before classify_idle() runs.
+
+with tab_setup:
+    st.subheader("Port / Activity-Type Setup & Configuration")
+    st.caption(
+        "Per the client's requirement doc §4.1. This is a first-class, live-editable "
+        "screen -- add, edit, or delete a port's configuration here and the whole "
+        "app recomputes instantly. Leave **Activity Type** blank for a port-level "
+        "default that applies whenever no more specific row matches."
+    )
+
+    seed_df = load_seed_config(STORAGE_SLAB_PATH)
+    if "port_config_df" not in st.session_state:
+        st.session_state.port_config_df = seed_df[CONFIG_COLUMNS].copy()
+
+    if st.button("🔄 Reset to seed data (discard live edits)"):
+        st.session_state.port_config_df = seed_df[CONFIG_COLUMNS].copy()
+
+    edited_config_df = st.data_editor(
+        st.session_state.port_config_df,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "Free Days": st.column_config.NumberColumn(
+                min_value=0, step=1,
+                help="Leave blank if not yet known -- the port will show as unconfigured until this is filled in.",
+            ),
+            "Activity Type": st.column_config.TextColumn(
+                help="Leave blank for a port-level default applying to all activity types.",
+            ),
+        },
+        key="port_config_editor",
+    )
+    st.session_state.port_config_df = edited_config_df
+    port_config_df = edited_config_df
+
+    all_ports_in_data = activities_df["PORT"].dropna().unique()
+    configured_count = sum(
+        resolve_config(port_config_df, p, None) is not None for p in all_ports_in_data
+    )
+    st.metric("Ports configured (usable Free Days rule)", f"{configured_count} / {len(all_ports_in_data)}")
+
+    with st.expander("📄 Raw Storage_slab.xlsx seed reference (context only, not editable here)"):
+        st.caption("Shows the original Region and unparsed Free-Days text this seed data came from.")
+        st.dataframe(seed_df[["Port"] + SEED_CONTEXT_COLUMNS], width="stretch", hide_index=True)
+
+    st.subheader("Open questions / assumptions in this POC")
+    themed_alert(
+        "info",
+        "Whether <code>AGENT NAME</code> (from ClimaxSuite) and <strong>Trade Person Email</strong> "
+        "(from this Setup table) refer to the same person or different roles is currently "
+        "<strong>treated as different and unconfirmed</strong>.",
+    )
+    themed_alert(
+        "info",
+        "Whether Free Days genuinely varies by Activity Type within the same port, or is "
+        "typically uniform, is currently <strong>built to support both</strong> -- defaulting "
+        "to the port-level row when Activity Type isn't specified for a container.",
+    )
+    themed_alert(
+        "info",
+        "The seeded Setup/Configuration data (from <code>Storage_slab.xlsx</code>) covers a "
+        f"small fraction ({configured_count} of {len(all_ports_in_data)}) of the real ports "
+        "in the activity data, and is for <strong>demonstration only</strong>.",
+    )
+    themed_alert(
+        "info",
+        "Two-tier escalation (Head, then Director) waits one additional reminder-cadence "
+        "period after the Head escalation before escalating further -- the client's document "
+        "doesn't specify this wait exactly, so it currently <strong>reuses the same cadence</strong> "
+        "as an assumption.",
+    )
+    st.subheader("Explicitly out of scope for this POC")
+    st.markdown(
+        "- No live ClimaxSuite connection\n"
+        "- No live email/inbox parsing or extraction\n"
+        "- No real email sending, no external API calls\n"
+        "- No \"CRO-stage\" pre-depot idle category\n"
+        "- No fixed global day-count thresholds anywhere -- always resolved via the Setup/Configuration table\n"
+    )
+
+# ------------------------------------------------------------- pipeline run --
+
+idle_df, unconfigured_df = classify_idle(activities_df, port_config_df, config)
+report_df = build_email_report(idle_df, config)
+port_summary_df = build_port_summary(activities_df, idle_df, unconfigured_df, port_config_df)
 init_session_state(report_df)
 
-tab_dash, tab_report, tab_email, tab_sim, tab_config = st.tabs(
-    ["📊 Dashboard", "📋 Idle Container Report", "✉️ Email Preview",
-     "⏱️ Reminder Simulator", "⚙️ Config & Assumptions"]
-)
+port_lookup = {
+    row["CONTAINERNO"]: resolve_config(port_config_df, row["PORT"], row.get("ACTIVITY"))
+    for _, row in report_df.iterrows()
+}
 
 # --------------------------------------------------------------- dashboard --
 
 with tab_dash:
-    total = len(report_df)
-    ready = int((report_df["email_status"] == "READY").sum())
-    needs_review = total - ready
-    depo_gaps = int(report_df["depo_missing"].sum())
+    total_idle = len(report_df)
+    total_ports = len(port_summary_df)
+    configured_ports = int(port_summary_df["Configured"].sum())
+    unconfigured_eligible = int(port_summary_df["Eligible But Unconfigured"].sum())
+    ready = int((report_df["email_status"] == "READY").sum()) if not report_df.empty else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Idle containers detected", total)
-    c2.metric("Emails READY to send", ready)
-    c3.metric("Emails NEEDS REVIEW", needs_review)
-    c4.metric("Missing Depo (data gap)", depo_gaps)
+    c1.metric("Idle containers detected", total_idle)
+    c2.metric("Ports configured", f"{configured_ports} / {total_ports}")
+    c3.metric("Containers at unconfigured ports", unconfigured_eligible)
+    c4.metric("Emails READY to send", ready)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        by_cat = report_df["idle_category"].value_counts().reset_index()
-        by_cat.columns = ["Category", "Count"]
-        st.plotly_chart(px.bar(by_cat, x="Category", y="Count", title="Idle containers by category", template=PLOT_TEMPLATE), width='stretch')
-    with col2:
-        by_sev = report_df["severity_tier"].value_counts().reset_index()
-        by_sev.columns = ["Severity", "Count"]
-        st.plotly_chart(px.pie(by_sev, names="Severity", values="Count", title="By severity tier (reporting only)", template=PLOT_TEMPLATE), width='stretch')
+    st.subheader("Idle containers by Port (primary view)")
+    display_summary = port_summary_df.copy()
+    display_summary["Configured"] = display_summary["Configured"].map({True: "✅ Configured", False: "❌ Unconfigured"})
+    st.dataframe(display_summary, width="stretch", height=350, hide_index=True)
 
-    by_status = report_df["email_status"].value_counts().reset_index()
-    by_status.columns = ["Status", "Count"]
-    st.plotly_chart(px.bar(by_status, x="Status", y="Count", color="Status", title="Email readiness", template=PLOT_TEMPLATE), width='stretch')
+    if not report_df.empty:
+        col1, col2 = st.columns(2)
+        with col1:
+            by_cat = report_df["idle_category"].value_counts().reset_index()
+            by_cat.columns = ["Category", "Count"]
+            st.plotly_chart(px.bar(by_cat, x="Category", y="Count", title="Idle containers by category", template=PLOT_TEMPLATE), width="stretch")
+        with col2:
+            by_sev = report_df["severity_tier"].value_counts().reset_index()
+            by_sev.columns = ["Severity", "Count"]
+            st.plotly_chart(px.pie(by_sev, names="Severity", values="Count", title="By severity tier (reporting only)", template=PLOT_TEMPLATE), width="stretch")
+
+    st.subheader("Drill into a port")
+    selected_port = st.selectbox("Port", port_summary_df["PORT"].tolist())
+    port_row = port_summary_df[port_summary_df["PORT"] == selected_port].iloc[0]
+
+    if port_row["Configured"]:
+        port_idle = report_df[report_df["PORT"] == selected_port]
+        if port_idle.empty:
+            themed_alert("success", f"No idle containers at <strong>{selected_port}</strong> right now -- all within free days.")
+        else:
+            themed_alert(
+                "info",
+                f"Trade Person for <strong>{selected_port}</strong>: {port_row['Trade Person Email']}",
+            )
+            bcol1, bcol2, bcol3 = st.columns(3)
+            with bcol1:
+                st.plotly_chart(px.bar(counts_df(port_idle["SIZE"].astype(str), "Size"), x="Size", y="Count", template=PLOT_TEMPLATE, title="By Size"), width="stretch")
+            with bcol2:
+                st.plotly_chart(px.bar(counts_df(port_idle["TYPE"], "Type"), x="Type", y="Count", template=PLOT_TEMPLATE, title="By Type"), width="stretch")
+            with bcol3:
+                st.plotly_chart(px.bar(counts_df(port_idle["CKind"], "CKind"), x="CKind", y="Count", template=PLOT_TEMPLATE, title="By CKind"), width="stretch")
+
+            detail_cols = [
+                "CONTAINERNO", "idle_category", "days", "free_days", "days_overdue",
+                "severity_tier", "confidence_score", "email_status", "trade_person_email",
+            ]
+            st.dataframe(port_idle[detail_cols], width="stretch", height=300, hide_index=True)
+    else:
+        themed_alert(
+            "error",
+            f"<strong>{selected_port}</strong> has no free-days rule configured -- idle status cannot be "
+            "determined. Add a row for this port in the Setup & Configuration tab.",
+        )
+        port_containers = activities_df[activities_df["PORT"] == selected_port]
+        st.dataframe(
+            port_containers[["CONTAINERNO", "Mode", "ACTIVITY", "days", "SIZE", "TYPE", "CKind"]],
+            width="stretch", height=300, hide_index=True,
+        )
 
 # ------------------------------------------------------------------ report --
 
 with tab_report:
-    fc1, fc2, fc3, fc4 = st.columns(4)
-    cat_filter = fc1.multiselect("Category", sorted(report_df["idle_category"].unique()))
-    sev_filter = fc2.multiselect("Severity", sorted(report_df["severity_tier"].unique()))
-    status_filter = fc3.multiselect("Email status", sorted(report_df["email_status"].unique()))
-    search = fc4.text_input("Search container no.")
+    view = st.radio(
+        "View",
+        ["Idle containers (configured ports)", "Unconfigured ports (no free-days rule)"],
+        horizontal=True,
+    )
 
-    filtered = report_df.copy()
-    if cat_filter:
-        filtered = filtered[filtered["idle_category"].isin(cat_filter)]
-    if sev_filter:
-        filtered = filtered[filtered["severity_tier"].isin(sev_filter)]
-    if status_filter:
-        filtered = filtered[filtered["email_status"].isin(status_filter)]
-    if search:
-        filtered = filtered[filtered["CONTAINERNO"].str.contains(search, case=False, na=False)]
+    if view == "Idle containers (configured ports)":
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        cat_filter = fc1.multiselect("Category", sorted(report_df["idle_category"].unique()) if not report_df.empty else [])
+        sev_filter = fc2.multiselect("Severity", sorted(report_df["severity_tier"].unique()) if not report_df.empty else [])
+        status_filter = fc3.multiselect("Email status", sorted(report_df["email_status"].unique()) if not report_df.empty else [])
+        search = fc4.text_input("Search container no.")
 
-    display_cols = [
-        "CONTAINERNO", "idle_category", "PORT", "Depo", "days", "Agreed_Free_Days",
-        "days_overdue", "severity_tier", "confidence_score", "email_status", "review_reasons",
-    ]
-    st.dataframe(filtered[display_cols], width='stretch', height=500)
-    st.caption(f"Showing {len(filtered)} of {len(report_df)} idle containers")
+        filtered = report_df.copy()
+        if cat_filter:
+            filtered = filtered[filtered["idle_category"].isin(cat_filter)]
+        if sev_filter:
+            filtered = filtered[filtered["severity_tier"].isin(sev_filter)]
+        if status_filter:
+            filtered = filtered[filtered["email_status"].isin(status_filter)]
+        if search:
+            filtered = filtered[filtered["CONTAINERNO"].str.contains(search, case=False, na=False)]
 
-    csv_bytes = filtered[display_cols].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download filtered report (CSV)", csv_bytes, "idle_container_report.csv", "text/csv")
+        display_cols = [
+            "CONTAINERNO", "PORT", "idle_category", "Depo", "days", "free_days",
+            "days_overdue", "severity_tier", "confidence_score", "email_status",
+            "trade_person_email", "review_reasons",
+        ]
+        st.dataframe(filtered[display_cols], width="stretch", height=500)
+        st.caption(f"Showing {len(filtered)} of {len(report_df)} idle containers")
+
+        csv_bytes = filtered[display_cols].to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download filtered report (CSV)", csv_bytes, "idle_container_report.csv", "text/csv")
+    else:
+        themed_alert(
+            "warning",
+            f"{len(unconfigured_df)} containers are at ports with no usable free-days rule -- "
+            "idle status is <strong>unknown</strong>, not \"not idle\".",
+        )
+        port_filter = st.multiselect("Port", sorted(unconfigured_df["PORT"].dropna().unique()) if not unconfigured_df.empty else [])
+        uc_filtered = unconfigured_df.copy()
+        if port_filter:
+            uc_filtered = uc_filtered[uc_filtered["PORT"].isin(port_filter)]
+        st.dataframe(
+            uc_filtered[["CONTAINERNO", "PORT", "idle_category", "Mode", "ACTIVITY", "days", "REGION_NAME", "Country"]],
+            width="stretch", height=500,
+        )
+        st.caption(f"Showing {len(uc_filtered)} of {len(unconfigured_df)} unconfigured-port containers")
 
 # ------------------------------------------------------------------- email --
 
@@ -309,25 +490,25 @@ with tab_email:
         if row["review_reasons"] != "none":
             themed_alert("error", f"Review reasons: {row['review_reasons']}")
 
-        st.text_area("Filled email template", row["email_text"], height=220)
+        st.text_area("Filled email template", row["email_text"], height=240)
 
 # ---------------------------------------------------------------- simulator --
 
 with tab_sim:
     st.markdown(
         "Drives `src/reminder_engine.process_run` with a **simulated clock** -- "
-        "no real time passes and no real emails are sent. Cadence and escalation "
-        "trigger come from the sidebar config."
+        "no real time passes and no real emails are sent. Reminders route to each "
+        "port's Trade Person; escalation routes to that port's Head, then Director."
     )
 
     idle_containers = report_df["CONTAINERNO"].tolist()
 
     bcol1, bcol2, bcol3 = st.columns(3)
-    if bcol1.button("▶️ Play full 6-step demo lifecycle", width='stretch'):
+    if bcol1.button("▶️ Play full 6-step demo lifecycle", width="stretch"):
         play_full_demo(idle_containers, config)
-    if bcol2.button(f"⏭️ Advance {config['reminder_cadence_days']} simulated day(s)", width='stretch'):
+    if bcol2.button(f"⏭️ Advance {config['reminder_cadence_days']} simulated day(s)", width="stretch"):
         run_one_step(idle_containers, config, config["reminder_cadence_days"])
-    if bcol3.button("🔄 Reset simulation", width='stretch'):
+    if bcol3.button("🔄 Reset simulation", width="stretch"):
         reset_simulation(report_df)
 
     themed_alert("info", f"<strong>Simulated date:</strong> {st.session_state.sim_date.isoformat()}")
@@ -350,14 +531,21 @@ with tab_sim:
                 st.markdown(f"**`{container_no}`**")
                 sub_log = [e for e in st.session_state.sim_log if e["container_no"] == container_no]
                 if sub_log:
-                    st.dataframe(pd.DataFrame(sub_log)[["run_date", "event", "detail"]], width='stretch', hide_index=True)
+                    sub_df = pd.DataFrame(sub_log)[["run_date", "event", "detail"]].copy()
+                    sub_df["recipient"] = [
+                        resolve_event_recipient(container_no, e["event"], port_lookup) for e in sub_log
+                    ]
+                    st.dataframe(sub_df, width="stretch", hide_index=True)
                 else:
                     st.caption("No events yet -- click a button above to start the simulation.")
 
     st.subheader("Full event log")
     if st.session_state.sim_log:
         log_df = pd.DataFrame(st.session_state.sim_log)
-        st.dataframe(log_df, width='stretch', height=350)
+        log_df["recipient"] = [
+            resolve_event_recipient(r["container_no"], r["event"], port_lookup) for r in st.session_state.sim_log
+        ]
+        st.dataframe(log_df, width="stretch", height=350)
         st.download_button(
             "⬇️ Download event log (CSV)",
             log_df.to_csv(index=False).encode("utf-8"),
@@ -366,25 +554,3 @@ with tab_sim:
         )
     else:
         st.caption("No simulated runs yet.")
-
-# ------------------------------------------------------------------ config --
-
-with tab_config:
-    st.subheader("Current effective config")
-    st.json(config)
-
-    st.subheader("⚠️ Data assumptions")
-    st.markdown(
-        f"- `Agreed_Free_Days` is **{SYNTHETIC_DATA_NOTICE.lower()}**\n"
-        "- Real values will come from parsing client email correspondence + ClimaxSuite (out of scope for this POC)\n"
-        "- Missing `Depo` is treated as \"still at yard\" and flagged as a data gap, not excluded\n"
-    )
-
-    st.subheader("Explicitly out of scope for this POC")
-    st.markdown(
-        "- No live ClimaxSuite connection\n"
-        "- No live email/inbox parsing\n"
-        "- No real email sending, no external API calls\n"
-        "- No \"CRO-stage\" pre-depot idle category\n"
-        "- No fixed day-count thresholds anywhere in the detection logic -- always per-container `days > Agreed_Free_Days`\n"
-    )
