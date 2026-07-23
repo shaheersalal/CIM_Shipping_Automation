@@ -10,6 +10,7 @@ port_config_store.py) and is imported unchanged from the CLI version.
 """
 import io
 import json
+import re
 from datetime import date, timedelta
 
 import pandas as pd
@@ -17,7 +18,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.config_loader import load_config
-from src.port_config_store import seed_from_storage_slab, resolve_config, CONFIG_COLUMNS, SEED_CONTEXT_COLUMNS
+from src.port_config_store import seed_from_storage_slab, resolve_config, parse_free_days, CONFIG_COLUMNS, SEED_CONTEXT_COLUMNS
 from src.rule_engine import classify_idle, build_port_summary, SAMPLE_CONFIG_NOTICE
 from src.email_templates import build_email_report
 from src.reminder_engine import ReminderStateStore, process_run
@@ -178,6 +179,77 @@ def counts_df(series: pd.Series, label: str) -> pd.DataFrame:
     return vc
 
 
+# "Chat box" quick-entry for the Setup form (client's requested UX: minimal
+# guidance, every field skippable, fill any field in any order). Understands
+# an explicit "field: value" prefix for precision, with freeform fallbacks
+# for a lazier one-shot reply.
+QUICKADD_PREFIXES = {
+    "port": "Port", "location": "Port",
+    "activity": "Activity Type", "activity type": "Activity Type",
+    "free days": "Free Days", "days": "Free Days", "freedays": "Free Days",
+    "trade": "Trade Person Email", "trade email": "Trade Person Email", "trade person email": "Trade Person Email",
+    "head": "Head Email", "head email": "Head Email",
+    "director": "Director Email", "director email": "Director Email",
+}
+
+
+def _quickadd_still_missing(draft: dict) -> str:
+    missing = [f for f in CONFIG_COLUMNS if not draft.get(f)]
+    if not missing:
+        return "That's everything -- hit **Save** below whenever you like."
+    return f"Still open: {', '.join(missing)} (all optional -- skip anything, or click Save as-is)."
+
+
+def parse_quickadd_message(text: str, draft: dict) -> tuple[dict, str]:
+    text = text.strip()
+    if not text:
+        return draft, "Type anything -- a port name, an email, free days -- or use the buttons below."
+
+    if text.lower() in ("skip", "done", "save"):
+        return draft, "Okay -- use the Save button below whenever you're ready."
+
+    if ":" in text:
+        prefix, _, value = text.partition(":")
+        key = prefix.strip().lower()
+        value = value.strip()
+        if key in QUICKADD_PREFIXES and value:
+            field = QUICKADD_PREFIXES[key]
+            if field == "Free Days":
+                parsed = parse_free_days(value)
+                draft[field] = parsed
+                if parsed is None:
+                    return draft, f"Got '{value}' for Free Days but couldn't find a number in it -- try e.g. 'free days: 45'."
+            else:
+                draft[field] = value
+            return draft, f"Got it -- {field}: {draft[field]}. {_quickadd_still_missing(draft)}"
+
+    if "@" in text:
+        draft["Trade Person Email"] = text
+        return draft, (
+            f"Assumed that's the Trade Person Email: {text}. If it was actually Head or Director, "
+            f"reply 'head: {text}' or 'director: {text}' to correct it. {_quickadd_still_missing(draft)}"
+        )
+
+    if re.fullmatch(r"[\d\s\-/+]+(days?)?", text, flags=re.IGNORECASE):
+        parsed = parse_free_days(text)
+        if parsed is not None:
+            draft["Free Days"] = parsed
+            return draft, f"Got it -- Free Days: {parsed}. {_quickadd_still_missing(draft)}"
+
+    if not draft.get("Port"):
+        draft["Port"] = text
+        return draft, f"Got it -- Port: {text}. {_quickadd_still_missing(draft)}"
+
+    if not draft.get("Activity Type"):
+        draft["Activity Type"] = text
+        return draft, f"Got it -- Activity Type: {text}. {_quickadd_still_missing(draft)}"
+
+    return draft, (
+        "Not sure which field that's for -- try a prefix like 'port: ...', 'activity: ...', "
+        "'free days: ...', 'trade: you@x.com', 'head: ...', 'director: ...', or just click Save below."
+    )
+
+
 def resolve_event_recipient(container_no: str, event: str, port_lookup: dict) -> str:
     contacts = port_lookup.get(container_no)
     if not contacts:
@@ -272,6 +344,58 @@ with tab_setup:
 
     if st.button("🔄 Reset to seed data (discard live edits)"):
         st.session_state.port_config_df = seed_df[CONFIG_COLUMNS].copy()
+
+    st.markdown("#### 💬 Quick Add")
+    st.caption(
+        "Type it like a chat, in any order, skip anything -- e.g. 'LAEM CHABANG', then "
+        "'free days: 45', then an email. Prefix with 'trade:'/'head:'/'director:' if a typed "
+        "email isn't the Trade Person one."
+    )
+
+    if "quickadd_draft" not in st.session_state:
+        st.session_state.quickadd_draft = {c: None for c in CONFIG_COLUMNS}
+    if "quickadd_messages" not in st.session_state:
+        st.session_state.quickadd_messages = []
+
+    for msg in st.session_state.quickadd_messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    quickadd_input = st.chat_input("Type anything about this port's config...", key="quickadd_chat_input")
+    if quickadd_input:
+        st.session_state.quickadd_messages.append({"role": "user", "content": quickadd_input})
+        updated_draft, reply = parse_quickadd_message(quickadd_input, st.session_state.quickadd_draft)
+        st.session_state.quickadd_draft = updated_draft
+        st.session_state.quickadd_messages.append({"role": "assistant", "content": reply})
+        st.rerun()
+
+    draft = st.session_state.quickadd_draft
+    badge_cols = st.columns(6)
+    for i, field in enumerate(CONFIG_COLUMNS):
+        filled = bool(draft.get(field))
+        with badge_cols[i]:
+            st.markdown(f"{'✅' if filled else '⬜'} **{field}**")
+            if filled:
+                st.caption(str(draft[field]))
+
+    qcol1, qcol2 = st.columns(2)
+    if qcol1.button("💾 Save this port to the config table", width="stretch"):
+        if not draft.get("Port"):
+            themed_alert("error", "Need at least a Port name before saving.")
+        else:
+            new_row = {c: draft.get(c) for c in CONFIG_COLUMNS}
+            st.session_state.port_config_df = pd.concat(
+                [st.session_state.port_config_df, pd.DataFrame([new_row])], ignore_index=True
+            )
+            st.session_state.quickadd_draft = {c: None for c in CONFIG_COLUMNS}
+            st.session_state.quickadd_messages = []
+            themed_alert("success", f"Saved {new_row['Port']} to the config table below.")
+    if qcol2.button("🔄 Discard and start over", width="stretch"):
+        st.session_state.quickadd_draft = {c: None for c in CONFIG_COLUMNS}
+        st.session_state.quickadd_messages = []
+
+    st.divider()
+    st.markdown("#### 📋 Full config table (bulk edit)")
 
     edited_config_df = st.data_editor(
         st.session_state.port_config_df,

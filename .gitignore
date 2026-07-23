@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 output/
 .streamlit/secrets.toml
+
+# Internal deal notes / client business docs -- this repo is public, keep these local-only
+CIM_Shipping_Deal_Chat_Log.md
+Emkay_Line Intro.docx
